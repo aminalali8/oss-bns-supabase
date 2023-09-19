@@ -1,0 +1,57 @@
+kind: Environment
+name: SupaBase
+type: primary
+components:
+  -
+    kind: Helm
+    name: my-app-release
+    runnerImage: 'dtzar/helm-kubectl:3.8.2'
+    deploy:
+      - |
+        cat << EOF > my_values.yaml
+            env: bunnyshell
+            serviceImage: {{ components.my-app-image.image }}
+            replicas: 1
+            ingress:
+                className: bns-nginx
+                host: my-app-{{ env.base_domain }}
+        EOF
+      - 'helm upgrade --install --namespace {{ env.k8s.namespace }} --dependency-update --post-renderer /bns/helpers/helm/add_labels/kustomize -f my_values.yaml my-app-{{ env.unique }} .'
+      - |
+        SERVICE_LB_IP=$(kubectl get services --namespace {{ env.k8s.namespace }} my-lb-service --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    destroy:
+      - 'helm uninstall my-app-{{ env.unique }} --namespace {{ env.k8s.namespace }}'
+    start:
+      - 'helm upgrade --namespace {{ env.k8s.namespace }} --post-renderer /bns/helpers/helm/add_labels/kustomize --reuse-values --set replicas=1 my-app-{{ env.unique }} .'
+    stop:
+      - 'helm upgrade --namespace {{ env.k8s.namespace }} --post-renderer /bns/helpers/helm/add_labels/kustomize --reuse-values --set replicas=0 my-app-{{ env.unique }} .'
+    exportVariables:
+      - SERVICE_LB_IP
+    gitRepo: 'https://gitlab.com/dev-test.buzachis/neo-dev-test.git'
+    gitBranch: master
+    gitApplicationPath: /
+components:
+  -
+    kind: KubernetesManifest
+    name: my-app
+    runnerImage: 'alpine/k8s:1.22.15'
+    deploy:
+      - 'kustomize create --autodetect --recursive --labels=app.kubernetes.io/instance-my-app:bns,app.kubernetes.io/part-of:env-{{ env.unique }} --namespace {{ env.k8s.namespace }}'
+      - 'kustomize edit set image nginx={{ components.my-app-image.image }}'
+      - |
+        kustomize edit add patch --kind Deployment --name my-app --patch '[{"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {"name": "ENV", "value": "bunnyshell"}}]'
+      - 'sed -i "s/my-app.mydomain.com/my-app-{{ env.base_domain }}/g" ingress.yaml'
+      - 'kubectl apply -k .'
+      - SERVICE_ENDPOINT="https://my-app-{{ env.base_domain }}/api"
+    destroy:
+      - 'kustomize create --autodetect --recursive --namespace {{ env.k8s.namespace }}'
+      - 'kubectl delete -k .'
+    start:
+      - 'kubectl scale --replicas=2 --namespace {{ env.k8s.namespace }} deployment/my-app'
+    stop:
+      - 'kubectl scale --replicas=0 --namespace {{ env.k8s.namespace }} deployment/my-app'
+    exportVariables:
+      - SERVICE_ENDPOINT
+    gitRepo: 'https://gitlab.com/example/my-app.git'
+    gitBranch: master
+    gitApplicationPath: /
