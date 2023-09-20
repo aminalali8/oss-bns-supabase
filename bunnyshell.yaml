@@ -1,20 +1,131 @@
 kind: Environment
 name: SupaBase
 type: primary
+environmentVariables:
+  JWT_SECRET: 'VERYSECUREJWTSECRET'
+  SMTP_EMAIL: 'admin@smtp.com'
+  SMTP_PASSWORD: 'adminpassword'
+  DB_USERNAME: 'postgres'
+  DB_PASSWORD: 'adminpassword'
 components:
+  - kind: KubernetesManifest
+    name: secret-generator
+    runnerImage: 'alpine/k8s:1.22.15'
+    deploy:
+      - 'sudo apk update'
+      - 'sudo apk add jq'
+      - 'JWT_TOKEN=$(openssl rand 64 | base64)'
+      - 'JWT_SECRET_NAME=supabase-jwt-{{env.unique}}'
+      - 'SMTP_SECRET_NAME=supabase-smtp-{{env.unique}}'
+      - 'DB_SECRET_NAME=supabase-db-{{env.unique}}'
+      - 'chmod +x jwt-generator.sh'
+      - './jwt-generator.sh'
+      - |
+        # Create JWT secret
+        kubectl -n {{env.k8s.namespace}} create secret generic $JWT_SECRET_NAME \
+        --from-literal=anonKey='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ewogICAgInJvbGUiOiAiYW5vbiIsCiAgICAiaXNzIjogInN1cGFiYXNlIiwKICAgICJpYXQiOiAxNjc1NDAwNDAwLAogICAgImV4cCI6IDE4MzMxNjY4MDAKfQ.ztuiBzjaVoFHmoljUXWmnuDN6QU2WgJICeqwyzyZO88' \
+        --from-literal=serviceKey='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ewogICAgInJvbGUiOiAic2VydmljZV9yb2xlIiwKICAgICJpc3MiOiAic3VwYWJhc2UiLAogICAgImlhdCI6IDE2NzU0MDA0MDAsCiAgICAiZXhwIjogMTgzMzE2NjgwMAp9.qNsmXzz4tG7eqJPh1Y58DbtIlJBauwpqx39UF-MwM8k' \
+        --from-literal=secret='$JWT_TOKEN'
+  
+        # Create SMTP secret
+        kubectl -n {{env.k8s.namespace}} create secret generic $SMTP_SECRET_NAME \
+        --from-literal=username='{{env.vars.SMTP_EMAIL}}' \
+        --from-literal=password='{{env.vars.SMTP_PASSWORD}}'
+  
+        # Create DB secret
+        kubectl -n {{env.k8s.namespace}} create secret generic $DB_SECRET_NAME \
+        --from-literal=username='{{env.vars.DB_USERNAME}}' \
+        --from-literal=password='{{env.vars.DB_PASSWORD}}'
+    destroy:
+      - |
+        kubectl -n {{env.k8s.namespace}} delete secret generic $JWT_SECRET_NAME
+        kubectl -n {{env.k8s.namespace}} delete secret generic $SMTP_SECRET_NAME
+        kubectl -n {{env.k8s.namespace}} delete secret generic $DB_SECRET_NAME
+    start:
+      - 'echo "N/A"'
+    stop:
+      - 'echo "N/A"'
+    exportVariables:
+      - JWT_ANON=$JWT_ANON
+      - JWT_SVC=$JWT_SVC
+      - JWT_SECRET_NAME
+      - SMTP_SECRET_NAME
+      - DB_SECRET_NAME
+    gitRepo: 'https://github.com/aminalali8/oss-bns-supabase.git'
+    gitBranch: main
+    gitApplicationPath: /
   -
     kind: Helm
-    name: my-app-release
+    name: supabase
     runnerImage: 'dtzar/helm-kubectl:3.8.2'
     deploy:
       - |
         cat << EOF > my_values.yaml
-            env: bunnyshell
-            serviceImage: {{ components.my-app-image.image }}
-            replicas: 1
-            ingress:
-                className: bns-nginx
-                host: my-app-{{ env.base_domain }}
+            # jwt will be used to reference secret in multiple services:
+            # Anon & Service key: Studio, Storage, Kong
+            # JWT Secret: Auth, Rest, Realtime, Storage
+            jwt:
+              secretName: "{{env.vars.JWT_SECRET_NAME}}"
+            # smtp will be used to reference secret including smtp credentials
+            smtp:
+              secretName: "{{env.vars.SMTP_SECRET_NAME}}"
+            # Optional: Postgres Database
+            # A standalone Postgres database configured to work with Supabase services.
+            # You can spin up any other Postgres database container if required.
+            # If so, make sure to adjust DB_HOST accordingly to point to the right database service.
+            
+            db:
+              enabled: false
+              secretName: "{{env.vars.DB_SECRET_NAME}}"
+              replicaCount: 1
+              service:
+                type: ClusterIP #LoadBalancer
+                port: 5432
+                ingress:
+                  enabled: false
+                  className: "bns-nginx"
+                  annotations:
+                    nginx.ingress.kubernetes.io/rewrite-target: /
+                  hosts:
+                    - host: db-{{env.base_domain}} #bunnyshell generated host
+                      paths:
+                        - path: /
+                          pathType: Prefix
+                          backend:
+                            serviceName: database
+                            servicePort: 5432
+            studio:
+              enabled: true 
+                service:
+                  type: ClusterIP
+                  port: 3000
+                environment:
+                  SUPABASE_URL: https://API-{{env.base_domain}}
+                  SUPABASE_REST_URL: https://API-{{env.base_domain}}/rest/v1/
+                  STUDIO_PG_META_URL: http://supabase-kong.{{env.k8s.namespace}}.svc.cluster.local:8000/pg
+                ingress:
+                  enabled: true
+                  className: "bns-nginx"
+                  annotations:
+                    nginx.ingress.kubernetes.io/rewrite-target: /
+                  hosts:
+                    - host: studio-{{env.base_domain}}
+                      paths:
+                        - path: /
+                          pathType: Prefix
+                          backend:
+                            serviceName: api
+                            servicePort: 3000
+            auth:
+              environment:
+                DB_HOST: database.{{env.k8s.namespace}}.svc.cluster.local
+                GOTRUE_SITE_URL: https://studio-{{env.base_domain}}
+            rest: 
+                environment:
+                  DB_HOST: database.{{env.k8s.namespace}}.svc.cluster.local
+            storage: 
+              environment: 
+                POSTGREST_URL: http://supabase-rest.{{env.k8s.namespace}}.svc.cluster.local:3000
         EOF
       - 'helm upgrade --install --namespace {{ env.k8s.namespace }} --dependency-update --post-renderer /bns/helpers/helm/add_labels/kustomize -f my_values.yaml my-app-{{ env.unique }} .'
       - |
@@ -30,28 +141,4 @@ components:
     gitRepo: 'https://gitlab.com/dev-test.buzachis/neo-dev-test.git'
     gitBranch: master
     gitApplicationPath: /
-components:
-  -
-    kind: KubernetesManifest
-    name: my-app
-    runnerImage: 'alpine/k8s:1.22.15'
-    deploy:
-      - 'kustomize create --autodetect --recursive --labels=app.kubernetes.io/instance-my-app:bns,app.kubernetes.io/part-of:env-{{ env.unique }} --namespace {{ env.k8s.namespace }}'
-      - 'kustomize edit set image nginx={{ components.my-app-image.image }}'
-      - |
-        kustomize edit add patch --kind Deployment --name my-app --patch '[{"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {"name": "ENV", "value": "bunnyshell"}}]'
-      - 'sed -i "s/my-app.mydomain.com/my-app-{{ env.base_domain }}/g" ingress.yaml'
-      - 'kubectl apply -k .'
-      - SERVICE_ENDPOINT="https://my-app-{{ env.base_domain }}/api"
-    destroy:
-      - 'kustomize create --autodetect --recursive --namespace {{ env.k8s.namespace }}'
-      - 'kubectl delete -k .'
-    start:
-      - 'kubectl scale --replicas=2 --namespace {{ env.k8s.namespace }} deployment/my-app'
-    stop:
-      - 'kubectl scale --replicas=0 --namespace {{ env.k8s.namespace }} deployment/my-app'
-    exportVariables:
-      - SERVICE_ENDPOINT
-    gitRepo: 'https://gitlab.com/example/my-app.git'
-    gitBranch: master
-    gitApplicationPath: /
+
